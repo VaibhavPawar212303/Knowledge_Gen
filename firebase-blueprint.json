@@ -1,0 +1,73 @@
+{
+  "entities": {
+    "Project": {
+      "title": "Test Project",
+      "description": "A container for test cases and related documents.",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "description": "The name of the project" },
+        "description": { "type": "string", "description": "Short summary of the project" },
+        "ownerId": { "type": "string", "description": "UID of the user who owns the project" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "ownerId", "createdAt"]
+    },
+    "TestCase": {
+      "title": "Test Case",
+      "description": "An individual test scenario with steps and expected results.",
+      "type": "object",
+      "properties": {
+        "projectId": { "type": "string", "description": "Reference to the parent project" },
+        "title": { "type": "string", "description": "Title of the test case" },
+        "flow": { "type": "string", "description": "The user flow being tested" },
+        "steps": { "type": "array", "items": { "type": "string" }, "description": "Sequential steps to execute" },
+        "expectedResult": { "type": "string", "description": "The expected outcome" },
+        "status": { "type": "string", "enum": ["draft", "active", "deprecated"], "description": "Current lifecycle status" },
+        "authorId": { "type": "string", "description": "UID of the test creator" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["projectId", "title", "flow", "authorId", "createdAt"]
+    },
+    "Document": {
+      "title": "Knowledge Document",
+      "description": "Contextual documentation used for RAG to generate relevant test cases.",
+      "type": "object",
+      "properties": {
+        "projectId": { "type": "string", "description": "Reference to the project context" },
+        "name": { "type": "string", "description": "File name or title" },
+        "content": { "type": "string", "description": "The textual content of the document" },
+        "type": { "type": "string", "description": "MIME type or category (e.g., pdf, md, txt)" },
+        "ownerId": { "type": "string", "description": "UID of the uploader" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["projectId", "name", "content", "ownerId", "createdAt"]
+    }
+  },
+  "firestore": {
+    "projects": {
+      "schema": "Project",
+      "description": "Root collection for user projects"
+    },
+    "projects/{projectId}/testcases": {
+      "schema": "TestCase",
+      "description": "Test cases nested under projects for better isolation"
+    },
+    "projects/{projectId}/documents": {
+      "schema": "Document",
+      "description": "Contextual docs for RAG, scoped to projects"
+    },
+    "users": {
+        "schema": {
+            "type": "object",
+            "properties": {
+                "displayName": { "type": "string" },
+                "email": { "type": "string" },
+                "photoURL": { "type": "string" },
+                "createdAt": { "type": "string", "format": "date-time" }
+            }
+        },
+        "description": "Public user profiles"
+    }
+  }
+}
