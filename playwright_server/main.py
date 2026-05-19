@@ -96,10 +96,6 @@ async def make_browser_context(p, record_video=False, video_dir=None):
             "--font-render-hinting=none",
             "--force-color-profile=srgb",
             "--disable-features=TranslateUI,BlinkGenPropertyTrees",
-            "--run-all-compositor-stages-before-draw",
-            "--disable-threaded-animation",
-            # Allow very tall virtual viewports for full-page capture
-            "--virtual-time-budget=0",
         ],
     )
     ctx_opts = dict(
