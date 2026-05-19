@@ -4,7 +4,7 @@
 CONTAINER_NAME="playwright-api"
 IMAGE_NAME="playwright-server"
 PORT="7860"
-REPO_PATH="/playwright_server/" # Update this to your folder path
+REPO_PATH="/home/ubuntu/Knowledge_Gen/" # Update this to your folder path
 
 # --- PRE-FLIGHT CHECKS ---
 echo "🚀 Starting Deployment..."
