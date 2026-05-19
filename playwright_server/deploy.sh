@@ -18,7 +18,7 @@ git pull origin main || { echo "❌ Git pull failed"; exit 1; }
 
 # 2. Build the new Docker image
 echo "🏗️ Building new Docker image..."
-cd $REPO_PATH || { echo "❌ Error: Directory not found"; exit 1; }
+cd $REPO_PATH/playwright_server || { echo "❌ Error: Directory not found"; exit 1; }
 sudo docker build -t $IMAGE_NAME . || { echo "❌ Docker build failed"; exit 1; }
 
 # 3. Stop and remove the old container (if it exists)
