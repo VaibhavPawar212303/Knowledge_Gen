@@ -18,28 +18,24 @@ git pull origin main || { echo "❌ Git pull failed"; exit 1; }
 
 # 2. Build the new Docker image
 echo "🏗️ Building new Docker image..."
-docker build -t $IMAGE_NAME . || { echo "❌ Docker build failed"; exit 1; }
+sudo docker build -t $IMAGE_NAME . || { echo "❌ Docker build failed"; exit 1; }
 
 # 3. Stop and remove the old container (if it exists)
-if [ "$(docker ps -aq -f name=$CONTAINER_NAME)" ]; then
+if [ "$(sudo docker ps -aq -f name=$CONTAINER_NAME)" ]; then
     echo "🛑 Stopping existing container..."
-    docker stop $CONTAINER_NAME
-    docker rm $CONTAINER_NAME
+    sudo docker stop $CONTAINER_NAME
+    sudo docker rm $CONTAINER_NAME
 fi
 
 # 4. Start the new container
 echo "▶️ Starting new container on port $PORT..."
 # Adding --restart always ensures it starts if the AWS server reboots
-docker run -d \
-    --name $CONTAINER_NAME \
-    -p $PORT:$PORT \
-    --restart always \
-    $IMAGE_NAME
+sudo docker run -d  --name $CONTAINER_NAME -p $PORT:$PORT  --restart always $IMAGE_NAME
 
 # 5. Cleanup: Remove old/dangling images to save AWS disk space
 echo "🧹 Cleaning up old Docker images..."
-docker image prune -f
+sudo docker image prune -f
 
 echo "✅ Deployment Successful!"
 echo "----------------------------------------------"
-docker ps -f name=$CONTAINER_NAME
+sudo docker ps -f name=$CONTAINER_NAME
