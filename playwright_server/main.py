@@ -14,9 +14,9 @@ from urllib.parse import urljoin, urlparse
 
 app = FastAPI()
 
-VIDEO_DIR = "/tmp/videos"
+VIDEO_DIR      = "/tmp/videos"
 SCREENSHOT_DIR = "/tmp/screenshots"
-JOBS_DIR = "/tmp/jobs"
+JOBS_DIR       = "/tmp/jobs"
 os.makedirs(VIDEO_DIR, exist_ok=True)
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 os.makedirs(JOBS_DIR, exist_ok=True)
@@ -29,11 +29,11 @@ UA = (
     "Chrome/123.0.0.0 Safari/537.36"
 )
 
-VIEWPORT         = {"width": 1440, "height": 900}
-SCROLL_PAUSE_MS  = 500    # pause between scroll steps for lazy images
-SCROLL_STEP_PX   = 600    # px per scroll increment
-MAX_PAGE_HEIGHT  = 12000  # logical px cap before screenshot
-SETTLE_MS        = 1200   # final paint-settle wait after scroll-back-to-top
+VIEWPORT        = {"width": 1440, "height": 900}
+SCROLL_STEP_PX  = 500
+SCROLL_PAUSE_MS = 600
+MAX_PAGE_HEIGHT = 50000   # logical px — ~138 A4 pages
+SETTLE_MS       = 1500
 
 jobs: dict[str, dict] = {}
 
@@ -83,10 +83,6 @@ async def extract_links(page: Page, base_url: str) -> list[str]:
 
 # ─────────────────────────────────────────────────────
 # Browser / context factory
-# NOTE: device_scale_factor intentionally omitted —
-#       2× scale causes blank-repaint race on many sites.
-#       We capture at 1440px logical width which is already
-#       high-fidelity for screenshots.
 # ─────────────────────────────────────────────────────
 
 async def make_browser_context(p, record_video=False, video_dir=None):
@@ -99,15 +95,15 @@ async def make_browser_context(p, record_video=False, video_dir=None):
             "--disable-gpu",
             "--font-render-hinting=none",
             "--force-color-profile=srgb",
-            # Disable blink features that sometimes cause blank first-paint
             "--disable-features=TranslateUI,BlinkGenPropertyTrees",
             "--run-all-compositor-stages-before-draw",
             "--disable-threaded-animation",
+            # Allow very tall virtual viewports for full-page capture
+            "--virtual-time-budget=0",
         ],
     )
     ctx_opts = dict(
         viewport=VIEWPORT,
-        # ✅ NO device_scale_factor — it triggers repaint races on JS-heavy SPAs
         user_agent=UA,
         locale="en-US",
         timezone_id="America/New_York",
@@ -124,15 +120,10 @@ async def make_browser_context(p, record_video=False, video_dir=None):
 
     context = await browser.new_context(**ctx_opts)
 
-    # ✅ Block only pure tracking pixels — NOT analytics.js or tag managers
-    #    that some sites bundle with their main bundle on the same domain.
     BLOCK_DOMAINS = [
-        "googlesyndication.com",
-        "doubleclick.net",
-        "adservice.google.com",
-        "hotjar.com",
-        "clarity.ms",
-        "facebook.net/en_US/fbevents",
+        "googlesyndication.com", "doubleclick.net",
+        "adservice.google.com",  "hotjar.com",
+        "clarity.ms",            "facebook.net/en_US/fbevents",
         "connect.facebook.net",
     ]
     async def _route(route, request):
@@ -146,178 +137,381 @@ async def make_browser_context(p, record_video=False, video_dir=None):
 
 
 # ─────────────────────────────────────────────────────
-# Smart page loader — the key fix for white screenshots
+# Overlay / sticky-element removal
 # ─────────────────────────────────────────────────────
 
-async def load_page_fully(page: Page, url: str, timeout: int = 60_000):
-    """
-    Multi-stage load that waits for the page to be truly painted:
+OVERLAY_CSS = """
+    /* ── Cookie / GDPR / consent banners ── */
+    [class*='cookie'],[id*='cookie'],
+    [class*='consent'],[id*='consent'],
+    [class*='gdpr'],[id*='gdpr'],
+    [class*='privacy-banner'],
+    [id*='privacy-banner'],
+    [class*='cc-banner'],
+    [id*='cc-banner'],
+    /* ── Generic popups / modals ── */
+    [class*='popup'],[id*='popup'],
+    [class*='modal']:not([role='dialog'][aria-labelledby]),
+    [class*='overlay']:not(#app):not(#root),
+    /* ── Chat / support widgets ── */
+    #intercom-container,
+    .intercom-lightweight-app,
+    #hubspot-messages-iframe-container,
+    [class*='crisp'],[class*='drift'],
+    div[id^='beacon-container'],
+    iframe[src*='tawk.to'],
+    iframe[src*='zendesk'],
+    /* ── Sticky headers / navbars ── */
+    header[style*='position: sticky'],
+    header[style*='position:sticky'],
+    nav[style*='position: sticky'],
+    nav[style*='position:sticky'],
+    [class*='sticky-header'],
+    [class*='fixed-header'],
+    [class*='navbar-fixed'],
+    /* ── Notification bars ── */
+    [class*='announcement-bar'],
+    [class*='notice-bar'],
+    [class*='top-bar'][style*='fixed']
+    {
+        display: none !important;
+        visibility: hidden !important;
+        pointer-events: none !important;
+    }
 
-    Stage 1 — Navigate (domcontentloaded only — networkidle hangs SPAs)
-    Stage 2 — Wait for an actual DOM element, not just the HTML shell
-    Stage 3 — Wait for all <img> tags to finish decoding
-    Stage 4 — Lazy-scroll top→bottom to trigger lazy images / infinite scroll
-    Stage 5 — Scroll back to top, flush the paint queue via rAF loop
-    Stage 6 — Hide cookie / chat overlays
-    """
+    /* ── Un-fix sticky/fixed elements so they appear at their natural position ── */
+    /* This is the most important rule: fixed elements show at y=0 on every     */
+    /* scroll-stitched tile, creating repeated headers in the screenshot.        */
+    *[style*='position: fixed']:not([class*='cookie']):not([id*='cookie']):not([class*='popup']),
+    *[style*='position:fixed']:not([class*='cookie']):not([id*='cookie']):not([class*='popup']) {
+        position: absolute !important;
+    }
+"""
 
-    # ── Stage 1: navigate ────────────────────────────────────────────────────
-    # Use domcontentloaded — it's reliable. We do our own "ready" detection below.
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
-    except Exception as e:
-        raise RuntimeError(f"Navigation failed for {url}: {e}")
-
-    # ── Stage 2: wait for JS framework to render at least one real child ─────
-    # "body *" means at least one element inside body — catches blank React roots.
-    try:
-        await page.wait_for_selector("body *", timeout=15_000)
-    except Exception:
-        pass  # static HTML pages may not need this
-
-    # Give JS frameworks (React, Vue, Angular, Next.js) time to hydrate.
-    # We use a JS-side rAF poll instead of a fixed sleep — faster and more accurate.
-    await page.evaluate("""
-        () => new Promise(resolve => {
-            // Wait until requestAnimationFrame fires twice — means the browser
-            // has committed at least one rendered frame to the screen.
-            let frames = 0;
-            function tick() {
-                frames++;
-                if (frames >= 2) resolve();
-                else requestAnimationFrame(tick);
+OVERLAY_JS = """
+    () => {
+        // Convert ALL fixed/sticky elements to absolute positioning
+        // so they appear exactly once in the full-page screenshot.
+        const els = document.querySelectorAll('*');
+        for (const el of els) {
+            const cs = window.getComputedStyle(el);
+            if (cs.position === 'fixed') {
+                el.style.setProperty('position', 'absolute', 'important');
             }
-            requestAnimationFrame(tick);
-        })
-    """)
+            if (cs.position === 'sticky') {
+                el.style.setProperty('position', 'relative', 'important');
+            }
+        }
+    }
+"""
 
-    # Extra settle for heavy SPA frameworks (Next.js, Nuxt, Angular Universal)
-    await page.wait_for_timeout(800)
+async def fix_fixed_elements(page: Page):
+    """
+    Two-pass approach:
+    1. CSS injection — catches elements styled via stylesheets (fast, catches most)
+    2. JS scan — catches elements with inline fixed/sticky styles (catches the rest)
+    """
+    try:
+        await page.add_style_tag(content=OVERLAY_CSS)
+    except Exception:
+        pass
+    try:
+        await page.evaluate(OVERLAY_JS)
+    except Exception:
+        pass
+    await page.wait_for_timeout(200)
 
-    # ── Stage 3: wait for all visible images to decode ───────────────────────
+
+# ─────────────────────────────────────────────────────
+# Full-page screenshot engine
+# ─────────────────────────────────────────────────────
+
+async def _wait_for_fonts_and_images(page: Page):
+    """Wait for web fonts and all images to fully render."""
     try:
         await page.evaluate("""
-            () => Promise.all(
-                [...document.images].map(img =>
-                    img.complete
-                        ? Promise.resolve()
-                        : new Promise(r => { img.onload = r; img.onerror = r; })
-                )
-            )
+            async () => {
+                // Wait for all web fonts to load
+                await document.fonts.ready;
+
+                // Wait for all images (including lazy ones) to decode
+                await Promise.all(
+                    [...document.images].map(img => {
+                        if (img.complete && img.naturalWidth > 0) return Promise.resolve();
+                        return new Promise(resolve => {
+                            img.addEventListener('load',  resolve, { once: true });
+                            img.addEventListener('error', resolve, { once: true });
+                            // Safety timeout per image
+                            setTimeout(resolve, 5000);
+                        });
+                    })
+                );
+            }
         """)
     except Exception:
         pass
 
-    # ── Stage 4: lazy-scroll top → bottom ────────────────────────────────────
-    await _scroll_to_bottom(page)
 
-    # ── Stage 5: scroll back to top + flush paint queue ──────────────────────
-    await page.evaluate("window.scrollTo({ top: 0, behavior: 'instant' })")
-
-    # rAF flush — wait for 3 frames after scroll-to-top to let sticky headers
-    # and parallax layers reposition before we capture.
-    await page.evaluate("""
-        () => new Promise(resolve => {
-            let f = 0;
-            function tick() { if (++f >= 3) resolve(); else requestAnimationFrame(tick); }
-            requestAnimationFrame(tick);
-        })
-    """)
-    await page.wait_for_timeout(SETTLE_MS)
-
-    # ── Stage 6: hide overlays that block content ─────────────────────────────
-    await _dismiss_overlays(page)
-
-
-async def _scroll_to_bottom(page: Page):
-    """Scroll incrementally, pausing to let lazy content load.
-    Re-measures page height on each step to handle infinite-scroll pages."""
-    viewport_h = VIEWPORT["height"]
-    current_y = 0
-
-    while True:
-        total_h = await page.evaluate("document.body.scrollHeight")
-        if current_y >= total_h:
-            break
-        current_y = min(current_y + SCROLL_STEP_PX, total_h)
-        await page.evaluate(f"window.scrollTo({{ top: {current_y}, behavior: 'instant' }})")
-        await page.wait_for_timeout(SCROLL_PAUSE_MS)
-
-        # Wait for any newly-triggered images to decode
-        try:
-            await page.evaluate("""
-                () => Promise.all(
-                    [...document.images]
-                        .filter(i => !i.complete)
-                        .map(i => new Promise(r => { i.onload = r; i.onerror = r; }))
-                )
-            """)
-        except Exception:
-            pass
-
-
-async def _dismiss_overlays(page: Page):
-    """Inject CSS to hide cookie banners, GDPR popups, and chat widgets."""
-    selectors = [
-        "[class*='cookie']","[id*='cookie']",
-        "[class*='consent']","[id*='consent']",
-        "[class*='gdpr']","[id*='gdpr']",
-        "[class*='banner']",
-        "[class*='popup']","[id*='popup']",
-        "[class*='modal'][style*='position: fixed']",
-        "#intercom-container",".intercom-lightweight-app",
-        "#hubspot-messages-iframe-container",
-        "[class*='crisp']","[class*='drift']",
-        "div[id^='beacon-container']",
-    ]
-    css = ",".join(selectors) + "{ display:none!important; visibility:hidden!important; }"
+async def _raf_flush(page: Page, frames: int = 3):
+    """Wait for N requestAnimationFrame ticks — ensures the compositor has painted."""
     try:
-        await page.add_style_tag(content=css)
-        await page.wait_for_timeout(150)
+        await page.evaluate(f"""
+            () => new Promise(resolve => {{
+                let f = 0;
+                function tick() {{ if (++f >= {frames}) resolve(); else requestAnimationFrame(tick); }}
+                requestAnimationFrame(tick);
+            }})
+        """)
     except Exception:
         pass
 
 
-# ─────────────────────────────────────────────────────
-# High-quality screenshot
-# ─────────────────────────────────────────────────────
+async def _measure_true_height(page: Page) -> int:
+    """
+    Measure the real content height using every method available.
+    Takes the maximum across all measurements to avoid missing content
+    hidden in overflow containers.
+    """
+    height = await page.evaluate("""
+        () => {
+            // Method 1: standard scroll/offset heights
+            const standard = Math.max(
+                document.body.scrollHeight    || 0,
+                document.body.offsetHeight    || 0,
+                document.body.clientHeight    || 0,
+                document.documentElement.scrollHeight || 0,
+                document.documentElement.offsetHeight || 0,
+                document.documentElement.clientHeight || 0
+            );
 
-async def capture_screenshot(page: Page) -> bytes:
+            // Method 2: bounding box of all elements
+            // Catches elements positioned below the normal document flow
+            let maxBottom = 0;
+            const walker = document.createTreeWalker(
+                document.body,
+                NodeFilter.SHOW_ELEMENT,
+                null
+            );
+            let node;
+            while ((node = walker.nextNode())) {
+                try {
+                    const rect = node.getBoundingClientRect();
+                    const absBottom = rect.bottom + window.scrollY;
+                    if (absBottom > maxBottom && absBottom < 100000) {
+                        maxBottom = absBottom;
+                    }
+                } catch(e) {}
+            }
+
+            return Math.max(standard, maxBottom);
+        }
+    """)
+    return min(int(height), MAX_PAGE_HEIGHT)
+
+
+async def _scroll_to_load_everything(page: Page):
     """
-    Capture at the page's real content height, capped at MAX_PAGE_HEIGHT.
-    Sets viewport to content height BEFORE screenshotting so nothing is clipped.
-    Uses full_page=False after resizing — more reliable than full_page=True
-    on sites that use overflow:hidden on body.
+    Scroll top → bottom in steps, waiting at each step for:
+    - Lazy images to decode
+    - IntersectionObserver callbacks to fire (used by React/Vue lazy components)
+    - New content injected by infinite scroll
     """
-    # Measure true content height
-    content_h = await page.evaluate("""
-        () => Math.max(
-            document.body.scrollHeight,
-            document.documentElement.scrollHeight,
-            document.body.offsetHeight,
-            document.documentElement.offsetHeight
+    prev_height = 0
+    current_y   = 0
+
+    while True:
+        total_h = await page.evaluate("document.body.scrollHeight")
+        if current_y >= min(total_h, MAX_PAGE_HEIGHT):
+            break
+
+        current_y = min(current_y + SCROLL_STEP_PX, total_h)
+        await page.evaluate(f"window.scrollTo({{ top: {current_y}, behavior: 'instant' }})")
+        await page.wait_for_timeout(SCROLL_PAUSE_MS)
+
+        # Wait for any newly-visible images at this scroll position
+        await _wait_for_fonts_and_images(page)
+        await _raf_flush(page, 2)
+
+        # Detect infinite scroll — page grew, keep going
+        new_h = await page.evaluate("document.body.scrollHeight")
+        if new_h > total_h:
+            total_h = new_h
+
+        # Safety: stop if we're not making progress (avoids infinite loop)
+        if new_h == prev_height and current_y >= total_h:
+            break
+        prev_height = new_h
+
+    # Scroll back to very top
+    await page.evaluate("window.scrollTo({ top: 0, behavior: 'instant' })")
+    await page.wait_for_timeout(300)
+
+
+async def _stitch_screenshot(page: Page, content_h: int) -> bytes:
+    """
+    Tile-based screenshot stitching using Pillow.
+    Takes overlapping viewport-sized snapshots as we scroll,
+    then stitches them into one tall PNG. This is the most
+    reliable method for pages taller than ~16,000px.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        # Pillow not installed — fall back to single-shot
+        return None
+
+    tile_h    = VIEWPORT["height"]
+    overlap   = 60      # px overlap between tiles to detect/remove seams
+    tiles     = []
+    positions = []
+    y         = 0
+
+    while y < content_h:
+        await page.evaluate(f"window.scrollTo({{ top: {y}, behavior: 'instant' }})")
+        await _raf_flush(page, 2)
+        await page.wait_for_timeout(150)
+
+        tile_bytes = await page.screenshot(
+            type="png",
+            full_page=False,   # just this viewport
+            animations="disabled",
+            caret="hide",
         )
-    """)
-    content_h = min(int(content_h), MAX_PAGE_HEIGHT)
+        tiles.append(tile_bytes)
+        positions.append(y)
 
-    # Resize viewport to full content height so everything is in the "viewport"
-    await page.set_viewport_size({"width": VIEWPORT["width"], "height": content_h})
+        y += tile_h - overlap
+        if y >= content_h:
+            break
 
-    # Another rAF flush after viewport resize — avoids blank-on-resize bug
-    await page.evaluate("""
-        () => new Promise(resolve => {
-            requestAnimationFrame(() => requestAnimationFrame(resolve));
-        })
-    """)
-    await page.wait_for_timeout(400)
+    # Scroll back to top
+    await page.evaluate("window.scrollTo({ top: 0, behavior: 'instant' })")
 
-    img_bytes = await page.screenshot(
-        full_page=False,      # ✅ viewport IS the full page now — avoids scroll-stitch bugs
-        type="png",
-        animations="disabled",
-        caret="hide",
-    )
-    return img_bytes
+    # Stitch tiles
+    imgs = [Image.open(io.BytesIO(t)) for t in tiles]
+    tile_w = imgs[0].width
+
+    full_img = Image.new("RGB", (tile_w, content_h), (255, 255, 255))
+    for img, pos in zip(imgs, positions):
+        full_img.paste(img, (0, pos))
+
+    out = io.BytesIO()
+    full_img.save(out, format="PNG", optimize=False)
+    out.seek(0)
+    return out.read()
+
+
+async def capture_full_page(page: Page) -> bytes:
+    """
+    Master capture function — tries three methods in order of reliability:
+
+    Method A: Viewport-resize then single shot
+              Best for: most normal pages under ~15k px tall
+    Method B: Tile-stitch with Pillow
+              Best for: very tall pages, pages with overflow:hidden on body
+    Method C: Playwright full_page=True
+              Fallback: simplest but can miss fixed elements and create seams
+    """
+
+    content_h = await _measure_true_height(page)
+
+    # ── Method A: resize viewport to full content height ─────────────────────
+    try:
+        # Set viewport to full content height
+        await page.set_viewport_size({"width": VIEWPORT["width"], "height": content_h})
+        await _raf_flush(page, 4)
+        await page.wait_for_timeout(500)
+
+        # Re-run font/image wait after resize (resize can trigger reflows)
+        await _wait_for_fonts_and_images(page)
+
+        img_bytes = await page.screenshot(
+            full_page=False,      # viewport IS the page — no stitching needed
+            type="png",
+            animations="disabled",
+            caret="hide",
+            clip={
+                "x": 0,
+                "y": 0,
+                "width": VIEWPORT["width"],
+                "height": content_h,
+            },
+        )
+
+        # Sanity check — reject if screenshot is suspiciously small
+        if len(img_bytes) > 5000:
+            return img_bytes
+    except Exception:
+        pass
+
+    # ── Method B: tile-stitch ─────────────────────────────────────────────────
+    try:
+        # Reset to normal viewport first
+        await page.set_viewport_size(VIEWPORT)
+        await _raf_flush(page, 2)
+
+        stitched = await _stitch_screenshot(page, content_h)
+        if stitched and len(stitched) > 5000:
+            return stitched
+    except Exception:
+        pass
+
+    # ── Method C: playwright full_page=True (last resort) ────────────────────
+    try:
+        await page.set_viewport_size(VIEWPORT)
+        img_bytes = await page.screenshot(
+            full_page=True,
+            type="png",
+            animations="disabled",
+            caret="hide",
+        )
+        return img_bytes
+    except Exception as e:
+        raise RuntimeError(f"All screenshot methods failed: {e}")
+
+
+# ─────────────────────────────────────────────────────
+# Smart page loader
+# ─────────────────────────────────────────────────────
+
+async def load_page_fully(page: Page, url: str, timeout: int = 60_000):
+    """
+    Six-stage load pipeline that ensures every pixel is rendered
+    before we hand off to the screenshot engine.
+    """
+
+    # ── Stage 1: Navigate ────────────────────────────────────────────────────
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+    except Exception as e:
+        raise RuntimeError(f"Navigation failed: {e}")
+
+    # ── Stage 2: Wait for JS framework to render ─────────────────────────────
+    # "body *" — at least one real element inside body (catches blank React roots)
+    try:
+        await page.wait_for_selector("body *", timeout=15_000)
+    except Exception:
+        pass
+
+    # Double rAF — browser has committed at least one rendered frame
+    await _raf_flush(page, 2)
+    await page.wait_for_timeout(800)
+
+    # ── Stage 3: Wait for fonts + initial images ──────────────────────────────
+    await _wait_for_fonts_and_images(page)
+
+    # ── Stage 4: Scroll to trigger all lazy content ───────────────────────────
+    await _scroll_to_load_everything(page)
+
+    # ── Stage 5: Fix fixed/sticky elements ───────────────────────────────────
+    await fix_fixed_elements(page)
+
+    # ── Stage 6: Final rAF flush + settle ────────────────────────────────────
+    await _raf_flush(page, 4)
+    await page.wait_for_timeout(SETTLE_MS)
+
+    # One more font+image check — lazy scroll may have revealed new images
+    await _wait_for_fonts_and_images(page)
 
 
 # ─────────────────────────────────────────────────────
@@ -338,7 +532,7 @@ def update_job(job_id: str, **kwargs):
 async def run_crawl_job(job_id: str, request: DeepCrawlRequest):
     start_url = normalize_url(request.url)
     visited: dict[str, dict] = {}
-    queue: list[str] = [start_url]
+    queue   = [start_url]
     out_dir = os.path.join(SCREENSHOT_DIR, job_id)
     os.makedirs(out_dir, exist_ok=True)
     update_job(job_id, status="running", progress=0, total=1, pages=[])
@@ -363,13 +557,13 @@ async def run_crawl_job(job_id: str, request: DeepCrawlRequest):
                     await stealth.apply_stealth_async(page)
                     await load_page_fully(page, url)
 
-                    meta["title"] = await page.title()
+                    meta["title"]  = await page.title()
                     meta["status"] = await page.evaluate(
                         "() => window.performance?.getEntriesByType('navigation')[0]?.responseStatus || 200"
                     )
 
                     if request.screenshot_each:
-                        img = await capture_screenshot(page)
+                        img      = await capture_full_page(page)
                         img_path = os.path.join(out_dir, f"{slug}.png")
                         with open(img_path, "wb") as f:
                             f.write(img)
@@ -386,6 +580,11 @@ async def run_crawl_job(job_id: str, request: DeepCrawlRequest):
                 except Exception as e:
                     meta["error"] = str(e)
                 finally:
+                    # Reset viewport before closing so next page starts clean
+                    try:
+                        await page.set_viewport_size(VIEWPORT)
+                    except Exception:
+                        pass
                     await page.close()
 
                 visited[url] = meta
@@ -397,15 +596,15 @@ async def run_crawl_job(job_id: str, request: DeepCrawlRequest):
             await browser.close()
 
         zip_path = os.path.join(SCREENSHOT_DIR, f"crawl_{job_id}.zip")
-        report = {"start_url": start_url, "pages_visited": len(visited),
-                  "pages": list(visited.values())}
+        report   = {"start_url": start_url, "pages_visited": len(visited),
+                    "pages": list(visited.values())}
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("crawl_report.json", json.dumps(report, indent=2))
             for m in visited.values():
                 if m.get("screenshot"):
-                    p = os.path.join(out_dir, m["screenshot"])
-                    if os.path.exists(p):
-                        zf.write(p, f"screenshots/{m['screenshot']}")
+                    ip = os.path.join(out_dir, m["screenshot"])
+                    if os.path.exists(ip):
+                        zf.write(ip, f"screenshots/{m['screenshot']}")
 
         update_job(job_id, status="done", progress=len(visited),
                    total=len(visited), zip_path=zip_path,
@@ -431,7 +630,7 @@ async def take_screenshot(request: CrawlRequest):
         await stealth.apply_stealth_async(page)
         try:
             await load_page_fully(page, request.url)
-            img_bytes = await capture_screenshot(page)
+            img_bytes = await capture_full_page(page)
             await browser.close()
             return StreamingResponse(io.BytesIO(img_bytes), media_type="image/png")
         except Exception as e:
@@ -462,9 +661,10 @@ async def record_video(request: CrawlRequest):
 @app.post("/crawl/start")
 async def start_crawl(request: DeepCrawlRequest, background_tasks: BackgroundTasks):
     job_id = str(uuid.uuid4())[:8]
-    jobs[job_id] = {"job_id": job_id, "status": "queued", "start_url": request.url,
-                    "progress": 0, "total": request.max_pages,
-                    "pages": [], "zip_path": None, "error": None}
+    jobs[job_id] = {"job_id": job_id, "status": "queued",
+                    "start_url": request.url, "progress": 0,
+                    "total": request.max_pages, "pages": [],
+                    "zip_path": None, "error": None}
     background_tasks.add_task(run_crawl_job, job_id, request)
     return {"job_id": job_id, "status": "queued", "poll": f"/crawl/status/{job_id}"}
 
@@ -492,7 +692,7 @@ async def crawl_download(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
     j = jobs[job_id]
     if j["status"] != "done":
-        raise HTTPException(status_code=400, detail=f"Job is {j['status']}, not ready yet")
+        raise HTTPException(status_code=400, detail=f"Job is {j['status']}, not ready")
     zp = j.get("zip_path")
     if not zp or not os.path.exists(zp):
         raise HTTPException(status_code=404, detail="ZIP not found")
@@ -501,7 +701,7 @@ async def crawl_download(job_id: str):
 
 @app.delete("/crawl/job/{job_id}")
 async def delete_job(job_id: str):
-    j = jobs.pop(job_id, None)
+    j  = jobs.pop(job_id, None)
     if j:
         zp = j.get("zip_path")
         if zp and os.path.exists(zp):
