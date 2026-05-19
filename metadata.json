@@ -1,6 +1,0 @@
-{
-  "name": "GenTest AI",
-  "description": "RAG-powered test case generation platform using Gemini for intelligent context-aware test flow design.",
-  "requestFramePermissions": [],
-  "majorCapabilities": []
-}
